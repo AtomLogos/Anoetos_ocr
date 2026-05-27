@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Inference: YOLOv8m detection + EfficientNet-B0/CosFace classification for ancient characters."""
-import json, os, sys, traceback
+import json, os, sys, traceback, warnings
 from pathlib import Path
+
+# Suppress noisy libpng iCCP warnings from PNG metadata
+warnings.filterwarnings("ignore", message=".*iCCP:.*")
 
 import torch
 import torch.nn as nn
@@ -97,6 +100,8 @@ def classify_crop(crop: Image.Image) -> str:
     """Classify a single character crop and return the Chinese character."""
     global _class_model
     backbone, cosface = _class_model
+    if crop.mode != "RGB":
+        crop = crop.convert("RGB")
     img = class_transform(crop).unsqueeze(0).to(device)
     features = backbone(img)
     logits = cosface(features)
