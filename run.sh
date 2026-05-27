@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-echo "Starting official PaddleOCR baseline inference..."
+echo "Starting ancient character inference (YOLO + EfficientNet)..."
 
 echo "===== Runtime paths ====="
 echo "PWD=$(pwd)"
@@ -22,91 +22,29 @@ if [ -z "${CUDA_VISIBLE_DEVICES:-}" ] && [ -n "${NVIDIA_VISIBLE_DEVICES:-}" ] \
   export CUDA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES}"
 fi
 
-mkdir -p /usr/local/cuda/lib64 || true
-for lib in libcuda.so libnvidia-ml.so; do
-  if [ ! -e "/usr/local/cuda/lib64/${lib}" ]; then
-    target="$(ldconfig -p 2>/dev/null | awk -v name="${lib}.1" '$1 == name && $NF !~ "/usr/local/cuda/compat/" {print $NF; exit}' || true)"
-    if [ -n "${target}" ]; then
-      ln -sf "${target}" "/usr/local/cuda/lib64/${lib}" || true
-    fi
-  fi
-done
-ldconfig || true
-
 echo "===== GPU diagnostics ====="
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-<unset>}"
-echo "NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-<unset>}"
-echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<unset>}"
 ls -l /dev/nvidia* 2>/dev/null || echo "/dev/nvidia* not found"
-ldconfig -p 2>/dev/null | grep -E 'libcuda|libnvidia-ml|libcudart|libcublas|libcudnn' || true
 
 if command -v nvidia-smi >/dev/null 2>&1; then
-  echo "nvidia-smi found: $(command -v nvidia-smi)"
   nvidia-smi || true
-  nvidia-smi -L || true
-else
-  echo "nvidia-smi not found in container PATH"
 fi
 
-python3 - <<'PY' || true
-import os
-import ctypes
-import ctypes.util
-
-print("Python CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"))
-print("Python NVIDIA_VISIBLE_DEVICES:", os.environ.get("NVIDIA_VISIBLE_DEVICES", "<unset>"))
-print("ctypes find_library cuda:", ctypes.util.find_library("cuda"))
-print("ctypes find_library cudart:", ctypes.util.find_library("cudart"))
-
-for lib_name in ("libcuda.so.1", "libcuda.so", "libcudart.so", "libnvidia-ml.so.1"):
-    try:
-        ctypes.CDLL(lib_name)
-        print(f"ctypes load {lib_name}: OK")
-    except Exception as exc:
-        print(f"ctypes load {lib_name}: {exc!r}")
-
-try:
-    cuda = ctypes.CDLL("libcuda.so.1")
-    count = ctypes.c_int()
-    init_ret = cuda.cuInit(0)
-    count_ret = cuda.cuDeviceGetCount(ctypes.byref(count))
-    print("CUDA driver cuInit return:", init_ret)
-    print("CUDA driver cuDeviceGetCount return:", count_ret)
-    print("CUDA driver device count:", count.value)
-except Exception as exc:
-    print("CUDA driver API check failed:", repr(exc))
-
-try:
-    import paddle
-
-    print("Paddle version:", paddle.__version__)
-    try:
-        print("Paddle compiled with CUDA:", paddle.device.is_compiled_with_cuda())
-    except Exception as exc:
-        print("Paddle CUDA compile check failed:", repr(exc))
-    try:
-        print("Paddle CUDA device count:", paddle.device.cuda.device_count())
-    except Exception as exc:
-        print("Paddle CUDA device count failed:", repr(exc))
-    try:
-        paddle.device.set_device("gpu:0")
-        print("Paddle set_device gpu:0: OK")
-    except Exception as exc:
-        print("Paddle set_device gpu:0 failed:", repr(exc))
-except Exception as exc:
-    print("Paddle import/check failed:", repr(exc))
-PY
+python3 -c "
+import torch
+print('CUDA available:', torch.cuda.is_available())
+print('CUDA devices:', torch.cuda.device_count())
+if torch.cuda.is_available():
+    print('GPU:', torch.cuda.get_device_name(0))
+"
 echo "===== End GPU diagnostics ====="
 
 if [ ! -d "/saisdata" ]; then
   echo "Warning: /saisdata not found; continuing so prediction.json can still be produced"
 fi
 
-if [ ! -d "/saisresult" ]; then
-  echo "Warning: /saisresult not found; attempting to create it"
-  mkdir -p /saisresult
-fi
+mkdir -p /saisresult
 
 python3 /app/src/run_inference.py
 

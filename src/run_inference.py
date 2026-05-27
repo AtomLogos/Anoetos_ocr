@@ -1,183 +1,192 @@
 #!/usr/bin/env python3
-import json
-import os
-import traceback
+"""Inference: YOLOv8m detection + EfficientNet-B0/CosFace classification for ancient characters."""
+import json, os, sys, traceback
 from pathlib import Path
 
-from paddleocr import PaddleOCR
+import torch
+import torch.nn as nn
+import torchvision.transforms as T
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from PIL import Image
+from ultralytics import YOLO
 
-
+# ── Paths ─────────────────────────────────────────────
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "/app/models"))
 INPUT_DIR = Path(os.getenv("INPUT_DIR", "/saisdata/13/eval/images"))
 OUTPUT_FILE = Path(os.getenv("OUTPUT_FILE", "/saisresult/prediction.json"))
-REQUEST_USE_GPU = os.getenv("USE_GPU", "1") not in {"0", "false", "False", "no", "NO"}
-USE_ANGLE_CLS = os.getenv("USE_ANGLE_CLS", "1") not in {"0", "false", "False", "no", "NO"}
-LANG = os.getenv("PADDLEOCR_LANG", "ch")
-MIN_SCORE = float(os.getenv("MIN_SCORE", "0.0"))
+CONF_THRESH = float(os.getenv("CONF_THRESH", "0.25"))
+IOU_THRESH = float(os.getenv("IOU_THRESH", "0.7"))
+YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "1280"))
 
+# ── Device ────────────────────────────────────────────
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"设备: {device}")
+if device.type == "cuda":
+    print(f"GPU: {torch.cuda.get_device_name(0)}, 显存: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
+# ── CosFace (same definition as training) ─────────────
+class CosFace(nn.Module):
+    def __init__(self, in_features, out_features, s=30.0, m=0.35):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, x, labels=None):
+        x = nn.functional.normalize(x, dim=1)
+        w = nn.functional.normalize(self.weight, dim=1)
+        cos_theta = torch.mm(x, w.t())
+        # Inference: no margin applied, just scale
+        return cos_theta * self.s
+
+# ── Load models (lazy, on first call) ─────────────────
+_yolo_model = None
+_class_model = None
+_label_to_ch = None
+
+def load_models():
+    global _yolo_model, _class_model, _label_to_ch
+
+    # 1. YOLO detection model
+    yolo_path = MODEL_DIR / "yolo_best.pt"
+    print(f"加载 YOLO 模型: {yolo_path}")
+    _yolo_model = YOLO(str(yolo_path))
+    print("YOLO 模型加载完成")
+
+    # 2. Label mapping
+    label_path = MODEL_DIR / "label_to_chinese.json"
+    with open(label_path) as f:
+        _label_to_ch = json.load(f)
+    _label_to_ch = {int(k): v for k, v in _label_to_ch.items()}
+    num_classes = max(_label_to_ch.keys()) + 1
+    print(f"标签映射加载完成: {num_classes} 个类别")
+
+    # 3. Classification model (EfficientNet-B0 + CosFace)
+    model_path = MODEL_DIR / "class_best.pth"
+    print(f"加载分类模型: {model_path}")
+    ckpt = torch.load(model_path, map_location=device, weights_only=True)
+
+    backbone = efficientnet_b0(weights=None)
+    backbone.classifier = nn.Identity()
+    backbone.load_state_dict(ckpt["model_state_dict"])
+    backbone = backbone.to(device).eval()
+
+    feat_dim = ckpt.get("feat_dim", 1280)
+    cosface = CosFace(feat_dim, num_classes)
+    cosface.load_state_dict(ckpt["arcface_state_dict"])
+    cosface = cosface.to(device).eval()
+
+    _class_model = (backbone, cosface)
+    print(f"分类模型加载完成 (val_acc={ckpt.get('val_acc', '?'):.4f})")
+
+# ── Image transform (match training) ─────────────────
+obc_mean = [0.85233593, 0.85246795, 0.8517555]
+obc_std  = [0.31232414, 0.3122127,  0.31273854]
+
+class_transform = T.Compose([
+    T.Resize((128, 128)),
+    T.ToTensor(),
+    T.Normalize(mean=obc_mean, std=obc_std),
+])
+
+@torch.no_grad()
+def classify_crop(crop: Image.Image) -> str:
+    """Classify a single character crop and return the Chinese character."""
+    global _class_model
+    backbone, cosface = _class_model
+    img = class_transform(crop).unsqueeze(0).to(device)
+    features = backbone(img)
+    logits = cosface(features)
+    pred = logits.argmax(dim=1).item()
+    return _label_to_ch.get(pred, f"???")
+
+# ── Find images ──────────────────────────────────────
 def find_images():
     suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
-
     if INPUT_DIR.exists():
-        return sorted(path for path in INPUT_DIR.iterdir() if path.suffix.lower() in suffixes)
-
-    fallback_root = Path("/saisdata")
-    if fallback_root.exists():
-        return sorted(path for path in fallback_root.rglob("*") if path.suffix.lower() in suffixes)
-
+        return sorted(p for p in INPUT_DIR.iterdir() if p.suffix.lower() in suffixes)
+    fallback = Path("/saisdata")
+    if fallback.exists():
+        return sorted(p for p in fallback.rglob("*") if p.suffix.lower() in suffixes)
     return []
 
-
-def normalize_ocr_lines(result):
-    if not result:
-        return []
-
-    if isinstance(result, list) and len(result) == 1:
-        return result[0] or []
-
-    return result if isinstance(result, list) else []
-
-
-def detect_use_gpu():
-    if not REQUEST_USE_GPU:
-        print("GPU disabled by USE_GPU=0")
-        return False
-
-    try:
-        import paddle
-
-        is_cuda_build = False
-        for checker in (
-            lambda: paddle.device.is_compiled_with_cuda(),
-            lambda: paddle.is_compiled_with_cuda(),
-        ):
-            try:
-                is_cuda_build = bool(checker())
-                break
-            except Exception:
-                continue
-
-        try:
-            gpu_count = int(paddle.device.cuda.device_count())
-        except Exception:
-            gpu_count = 0
-
-        print(f"Paddle CUDA build: {is_cuda_build}")
-        print(f"Visible CUDA devices: {gpu_count}")
-
-        if is_cuda_build and gpu_count > 0:
-            return True
-    except Exception as exc:
-        print(f"Warning: failed to check CUDA devices: {exc}")
-
-    print("GPU requested but no usable CUDA device was found; falling back to CPU.")
-    return False
-
-
-def polygon_to_bbox(points, image_width, image_height):
-    x_values = [float(point[0]) for point in points]
-    y_values = [float(point[1]) for point in points]
-
-    x1 = max(0, min(image_width - 1, int(round(min(x_values)))))
-    y1 = max(0, min(image_height - 1, int(round(min(y_values)))))
-    x2 = max(0, min(image_width, int(round(max(x_values)))))
-    y2 = max(0, min(image_height, int(round(max(y_values)))))
-
-    return [x1, y1, max(0, x2 - x1), max(0, y2 - y1)]
-
-
-def infer_one(ocr, image_path):
-    with Image.open(image_path) as img:
-        image_width, image_height = img.size
-
-    raw_result = ocr.ocr(str(image_path), cls=USE_ANGLE_CLS)
-    lines = normalize_ocr_lines(raw_result)
-
-    detections = []
-    for line in lines:
-        if not line or len(line) < 2:
-            continue
-
-        polygon = line[0]
-        text_score = line[1]
-        text = text_score[0] if text_score else ""
-        score = float(text_score[1]) if text_score and len(text_score) > 1 else 0.0
-
-        if not text or score < MIN_SCORE:
-            continue
-
-        bbox = polygon_to_bbox(polygon, image_width, image_height)
-        if bbox[2] <= 0 or bbox[3] <= 0:
-            continue
-
-        detections.append({
-            "bbox": [int(v) for v in bbox],
-            "text": str(text),
-        })
-
-    detections.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
-    return detections
-
-
+# ── Main ─────────────────────────────────────────────
 def main():
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-
     image_paths = find_images()
-    print(f"Input directory: {INPUT_DIR}")
-    print(f"Images found: {len(image_paths)}")
-    use_gpu = detect_use_gpu()
-    print(f"Use GPU requested: {REQUEST_USE_GPU}")
-    print(f"Use GPU actual: {use_gpu}")
-    print(f"Use angle classifier: {USE_ANGLE_CLS}")
-    print(f"Language: {LANG}")
-    print(f"Min score: {MIN_SCORE}")
+    print(f"输入目录: {INPUT_DIR}")
+    print(f"找到图片: {len(image_paths)}")
 
-    results = {}
     if not image_paths:
-        print("No images found; writing an empty prediction file.")
+        print("未找到图片, 输出空结果")
         with OUTPUT_FILE.open("w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"Saved: {OUTPUT_FILE}")
+            json.dump({}, f, ensure_ascii=False, indent=2)
+        print(f"已保存: {OUTPUT_FILE}")
         return
 
-    try:
-        ocr = PaddleOCR(
-            use_angle_cls=USE_ANGLE_CLS,
-            lang=LANG,
-            use_gpu=use_gpu,
-            show_log=False,
-        )
-    except Exception:
-        if not use_gpu:
-            raise
-        print("Warning: failed to initialize PaddleOCR with GPU; retrying on CPU.")
-        traceback.print_exc()
-        use_gpu = False
-        ocr = PaddleOCR(
-            use_angle_cls=USE_ANGLE_CLS,
-            lang=LANG,
-            use_gpu=False,
-            show_log=False,
-        )
+    load_models()
 
-    for index, image_path in enumerate(image_paths, start=1):
-        if index == 1 or index % 50 == 0:
-            print(f"[{index}/{len(image_paths)}] {image_path.name}")
+    results = {}
+    for idx, img_path in enumerate(image_paths, 1):
+        if idx == 1 or idx % 50 == 0:
+            print(f"[{idx}/{len(image_paths)}] {img_path.name}")
 
-        image_id = image_path.stem
+        image_id = img_path.stem
+        detections = []
         try:
-            results[image_id] = infer_one(ocr, image_path)
+            # YOLO detection
+            yolo_results = _yolo_model(
+                str(img_path),
+                imgsz=YOLO_IMGSZ,
+                conf=CONF_THRESH,
+                iou=IOU_THRESH,
+                device=device.type,
+                verbose=False,
+            )[0]
+
+            with Image.open(img_path) as full_img:
+                orig_w, orig_h = full_img.size
+
+            # Process each detected box
+            boxes = yolo_results.boxes
+            if boxes is not None and len(boxes) > 0:
+                # xyxy format → xywh
+                xyxy = boxes.xyxy.cpu().numpy()
+                for box in xyxy:
+                    x1, y1, x2, y2 = box
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    # Clamp to image bounds
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(orig_w, x2), min(orig_h, y2)
+                    if x2 - x1 <= 1 or y2 - y1 <= 1:
+                        continue
+
+                    # Crop from original image and classify
+                    with Image.open(img_path) as img:
+                        crop = img.crop((x1, y1, x2, y2))
+
+                    char = classify_crop(crop)
+                    detections.append({
+                        "bbox": [x1, y1, x2 - x1, y2 - y1],
+                        "text": char,
+                    })
+
+            # Sort top-to-bottom, left-to-right
+            detections.sort(key=lambda d: (d["bbox"][1], d["bbox"][0]))
         except Exception as exc:
-            print(f"Warning: failed to process {image_path}: {exc}")
+            print(f"警告: 处理 {img_path.name} 失败: {exc}")
             traceback.print_exc()
-            results[image_id] = []
+
+        results[image_id] = detections
 
     with OUTPUT_FILE.open("w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-
-    print(f"Saved: {OUTPUT_FILE}")
-
+    print(f"已保存: {OUTPUT_FILE}")
+    total_chars = sum(len(v) for v in results.values())
+    print(f"共处理 {len(results)} 张图片, 识别 {total_chars} 个古文字")
 
 if __name__ == "__main__":
     main()
